@@ -146,10 +146,6 @@ __kernel void filter_1x3_g(
 
 		int output = round( x0 + x1 + x2 );
 
-        if(dst_w > 600) {
-            //printf("(%3d, %3d): %d\n", ix, iy, output);
-        }
-
 		dst[iy*dst_w + ix ] = (short)output;
 	}
 }

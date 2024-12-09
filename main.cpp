@@ -8,6 +8,8 @@ static cl::Device device;
 static cl::Context context;
 static cl::CommandQueue queue;
 
+#define SINGLE_CHANNEL_TYPE CL_INTENSITY
+
 template<cl_channel_order co, cl_channel_type dt>
 struct ocl_image {
     cl::Image2D image_mem;
@@ -26,7 +28,7 @@ struct ocl_buffer {
 const int pyramid_lvls = 3;
 
 
-ocl_image<CL_R, CL_UNSIGNED_INT8> ocl_load_image(cl::Context context, std::string image_path) 
+ocl_image<SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8> ocl_load_image(cl::Context context, std::string image_path) 
 {
     cv::Mat image = cv::imread(image_path, cv::IMREAD_GRAYSCALE);
     if (image.empty()) 
@@ -37,7 +39,7 @@ ocl_image<CL_R, CL_UNSIGNED_INT8> ocl_load_image(cl::Context context, std::strin
     unsigned int w = image.cols;
     unsigned int h = image.rows;
 
-    cl::ImageFormat image_format(CL_R, CL_UNSIGNED_INT8);
+    cl::ImageFormat image_format(SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8);
 
     cl::Image2D image_mem(
                 context, 
@@ -49,7 +51,7 @@ ocl_image<CL_R, CL_UNSIGNED_INT8> ocl_load_image(cl::Context context, std::strin
                 image.data
             );
 
-    ocl_image<CL_R, CL_UNSIGNED_INT8> img;
+    ocl_image<SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8> img;
     img.w = w;
     img.h = h;
     img.image_format = image_format;
@@ -58,7 +60,7 @@ ocl_image<CL_R, CL_UNSIGNED_INT8> ocl_load_image(cl::Context context, std::strin
     return img;
 }
 
-cv::Mat save_ocl_image(ocl_image<CL_R, CL_UNSIGNED_INT8> img, cl::CommandQueue queue, std::string out_str)
+cv::Mat save_ocl_image(ocl_image<SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8> img, cl::CommandQueue queue, std::string out_str)
 {
     unsigned char *img_ub  = (unsigned char *)malloc( (img.w) * img.h ) ;
 
@@ -75,7 +77,7 @@ cv::Mat save_ocl_image(ocl_image<CL_R, CL_UNSIGNED_INT8> img, cl::CommandQueue q
     return cv_img;
 }
 
-cv::Mat save_ocl_image(ocl_image<CL_R, CL_SIGNED_INT16> img, cl::CommandQueue queue, std::string out_str)
+cv::Mat save_ocl_image(ocl_image<SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16> img, cl::CommandQueue queue, std::string out_str)
 {
     short *img_short = (short*)malloc(img.w * img.h * sizeof(short));
     unsigned char *img_ub = (unsigned char*)malloc(img.w * img.h);
@@ -112,6 +114,85 @@ cv::Mat save_ocl_image(ocl_image<CL_R, CL_SIGNED_INT16> img, cl::CommandQueue qu
     free(img_ub);
 
     return cv_img;
+}
+
+cv::Mat save_ocl_image(ocl_image<CL_RGBA, CL_SIGNED_INT32> img, cl::CommandQueue queue, std::string out_str)
+{
+    // Allocate memory for the input data and the normalized output data
+    int *img_int = (int *)malloc(img.w * img.h * 4 * sizeof(int)); // 4 channels for RGBA
+    unsigned char *img_ub = (unsigned char *)malloc(img.w * img.h * 4); // 4 channels for RGBA
+
+    cl::array<cl::size_type, 3> origin = {0, 0, 0};  // Start at the top-left corner of the image
+    cl::array<cl::size_type, 3> region = {img.w, img.h, 1};  // Full image dimensions
+
+    // Read the image data from the OpenCL image memory
+    queue.enqueueReadImage(img.image_mem, CL_TRUE, origin, region, img.w * 4 * sizeof(int), 0, (void *)img_int);
+
+    // Find the maximum positive value across all channels
+    int max_val = 0;
+    for (unsigned int i = 0; i < img.w * img.h * 4; i++) {
+        if (img_int[i] > max_val) {
+            max_val = img_int[i];
+        }
+    }
+
+    // Avoid division by zero
+    if (max_val == 0) max_val = 1;
+
+    // Normalize values for each channel
+    for (unsigned int i = 0; i < img.w * img.h * 4; i++) {
+        int val = img_int[i];
+        img_ub[i] = (val > 0) ? static_cast<unsigned char>((val * 255) / max_val) : 0;
+    }
+
+    // Create a cv::Mat with 4 channels (CV_8UC4) for RGBA data
+    cv::Mat cv_img(img.h, img.w, CV_8UC4, img_ub);
+
+    // Write the image to file
+    cv::imwrite(out_str, cv_img);
+
+    // Free allocated memory
+    free(img_int);
+    free(img_ub);
+
+    return cv_img;
+}
+
+void save_image_float2(ocl_buffer buff, cl::CommandQueue queue, std::string out_str)
+{
+    int width  = buff.w;
+    int height = buff.h;
+
+    // Each pixel has 2 float values (float2)
+    float *motion_data = (float *)malloc(width * height * 2 * sizeof(float)); 
+
+    queue.enqueueReadBuffer(buff.mem, CL_TRUE, 0, width * height * 2 * sizeof(float), motion_data);
+
+    cv::Mat cv_img = cv::Mat::zeros(height, width, CV_8UC3);
+
+    int sample_step = 10;
+    float scale = 10.0f;
+
+    for (int y = 0; y < height; y += sample_step) {
+        for (int x = 0; x < width; x += sample_step) {
+            int idx = (y * width + x) * 2;
+
+            float vx = motion_data[idx];
+            float vy = motion_data[idx + 1];
+
+            // printf("width: %d, height: %d, x,y (%d, %d) dx,dy (%.2f, %.2f)\n", width, height, x, y, vx, vy);
+
+            cv::Point start(x, y);
+            cv::Point end(x + static_cast<int>(vx), y + static_cast<int>(vy));
+
+            cv::arrowedLine(cv_img, start, end, cv::Scalar(0, 255, 0), 1, cv::LINE_AA, 0, 0.2);
+        }
+    }
+
+    cv::imwrite(out_str, cv_img);
+    free(motion_data);
+
+    return;
 }
 
 
@@ -191,6 +272,8 @@ cl::Kernel update_motion_kernel;
 cl::Kernel convert_kernel;
 cl::Kernel print_kernel;
 
+ocl_buffer flow_lvl[3];
+
 template<int lvls, cl_channel_order channel_order, cl_channel_type data_type>
 class ocl_pyramid 
 {
@@ -201,21 +284,20 @@ class ocl_pyramid
 
         ocl_pyramid();
         int init(int w, int h);
-        int fill(ocl_image<CL_R, CL_UNSIGNED_INT8>, cl::Kernel downfilter_x, cl::Kernel downfilter_y);
-
-        int pyr_fill(ocl_pyramid<3, CL_R, CL_UNSIGNED_INT8> pyramid, cl::Kernel, cl::Kernel, cl_int4, cl_int4);
-        // int convFill( ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8>, cl_kernel );
-        // int G_Fill(
-        //     ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16> &,
-        //     ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16> &,
-        //     cl_kernel  );
-        // int flowFill(
-        //     ocl_pyramid<3, SINGLE_CHANNEL_TYPE,      CL_UNSIGNED_INT8> &I,
-        //     ocl_pyramid<3, SINGLE_CHANNEL_TYPE,      CL_UNSIGNED_INT8> &J,
-        //     ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16> &Ix,
-        //     ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16> &Iy,
-        //     ocl_pyramid<3, CL_RGBA,      CL_SIGNED_INT32> &G,
-        //     cl_kernel );
+        int fill(ocl_image<SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8>, cl::Kernel downfilter_x, cl::Kernel downfilter_y);
+        int pyr_fill(ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8> pyramid, cl::Kernel, cl::Kernel, cl_int4, cl_int4);
+        int convFill(ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8>, cl::Kernel);
+        int G_Fill(
+            ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16> &,
+            ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16> &,
+            cl::Kernel);
+        int flowFill(
+            ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8> &I,
+            ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8> &J,
+            ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16> &Ix,
+            ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16> &Iy,
+            ocl_pyramid<3, CL_RGBA, CL_SIGNED_INT32> &G,
+            cl::Kernel);
 };
 
 template<int lvls, cl_channel_order channel_order, cl_channel_type data_type>
@@ -259,9 +341,12 @@ int ocl_pyramid<lvls,channel_order,data_type>::init(int w, int h)
     int sz;
     if (data_type == CL_UNSIGNED_INT8) {
         sz = sizeof(char);
-    }
-    if (data_type == CL_SIGNED_INT16) {
+    } else if (data_type == CL_SIGNED_INT16) {
         sz = sizeof(short);
+    } else if( data_type == CL_SIGNED_INT32 && channel_order == CL_RGBA ) {
+        sz = sizeof(cl_int) * 4 ;
+    } else if( data_type == CL_FLOAT && channel_order == CL_RGBA ) {
+        sz = sizeof(cl_float) * 4 ;
     }
     int size = scratch_buf.h * scratch_buf.w * sz;
     scratch_buf.mem = cl::Buffer(context, CL_MEM_READ_WRITE, size);
@@ -270,7 +355,7 @@ int ocl_pyramid<lvls,channel_order,data_type>::init(int w, int h)
 }
 
 template<int lvls, cl_channel_order channel_order, cl_channel_type data_type>
-int ocl_pyramid<lvls,channel_order,data_type>::fill(ocl_image<CL_R, CL_UNSIGNED_INT8> src_img, cl::Kernel downfilter_x, cl::Kernel downfilter_y)
+int ocl_pyramid<lvls,channel_order,data_type>::fill(ocl_image<SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8> src_img, cl::Kernel downfilter_x, cl::Kernel downfilter_y)
 {
     cl::array<cl::size_type, 3> src_origin  = {0, 0, 0};
     cl::array<cl::size_type, 3> dst_origin  = {0, 0, 0};
@@ -332,7 +417,7 @@ int ocl_pyramid<lvls,channel_order,data_type>::fill(ocl_image<CL_R, CL_UNSIGNED_
 }
 
 template<int lvls, cl_channel_order channel_order, cl_channel_type data_type>
-int ocl_pyramid<lvls,channel_order,data_type>::pyr_fill(ocl_pyramid<3, CL_R, CL_UNSIGNED_INT8> pyr, cl::Kernel kernel_x, cl::Kernel kernel_y, cl_int4 Wx, cl_int4 Wy)
+int ocl_pyramid<lvls,channel_order,data_type>::pyr_fill(ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8> pyr, cl::Kernel kernel_x, cl::Kernel kernel_y, cl_int4 Wx, cl_int4 Wy)
 {
     for (int i = 0; i < lvls; i++) {
 
@@ -385,11 +470,139 @@ int ocl_pyramid<lvls,channel_order,data_type>::pyr_fill(ocl_pyramid<3, CL_R, CL_
                 region
             );
         }
+
+        save_ocl_image(img_lvl[i], queue, "pyrfill"+std::to_string(i)+".png");
     }
 
     return 0;
 }
  
+
+template<int lvls, cl_channel_order channel_order, cl_channel_type data_type>
+int ocl_pyramid<lvls,channel_order,data_type>::convFill(ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8> pyr, cl::Kernel convert_kernel)
+{
+    for (int i = 0; i < lvls; i++) {
+
+        cl::NDRange local( 32, 4 );
+        cl::NDRange global( 32 * DivUp( pyr.img_lvl[i].w, 32 ), 4 * DivUp( pyr.img_lvl[i].h, 4) );
+
+        int arg_cnt = 0;
+        convert_kernel.setArg(arg_cnt++, pyr.img_lvl[i].image_mem);
+        convert_kernel.setArg(arg_cnt++, scratch_buf.mem);
+        convert_kernel.setArg(arg_cnt++, pyr.img_lvl[i].w);
+        convert_kernel.setArg(arg_cnt++, pyr.img_lvl[i].h);
+
+        queue.enqueueNDRangeKernel(convert_kernel, cl::NullRange, global, local);
+
+        {
+            cl::array<cl::size_type, 3> origin = { 0, 0, 0 };
+            cl::array<cl::size_type, 3> region = { pyr.img_lvl[i].w, pyr.img_lvl[i].h, 1 };
+
+            queue.enqueueCopyBufferToImage(
+                scratch_buf.mem,
+                img_lvl[i].image_mem,
+                0,
+                origin,
+                region
+            );
+        }
+    }
+
+    return 0;
+}
+
+
+template<int lvls, cl_channel_order channel_order, cl_channel_type data_type>
+cl_int ocl_pyramid<lvls,channel_order,data_type>::G_Fill( 
+            ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16> &Ix,
+            ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16> &Iy,
+            cl::Kernel kernel_G)
+{
+    for (int i = 0; i < lvls; i++) {
+
+        cl::NDRange local (32, 4);
+        cl::NDRange global( 32 * DivUp( img_lvl[i].w, 32 ), 4 * DivUp( img_lvl[i].h, 4) );
+
+        int arg_cnt = 0;
+        kernel_G.setArg(arg_cnt++, Ix.img_lvl[i].image_mem);
+        kernel_G.setArg(arg_cnt++, Iy.img_lvl[i].image_mem);
+        kernel_G.setArg(arg_cnt++, scratch_buf.mem);
+        kernel_G.setArg(arg_cnt++, Iy.img_lvl[i].w);
+        kernel_G.setArg(arg_cnt++, Iy.img_lvl[i].h);
+
+        queue.enqueueNDRangeKernel(kernel_G, cl::NullRange, global, local);
+
+        {
+            cl::array<cl::size_type, 3> origin = { 0, 0, 0 };
+            cl::array<cl::size_type, 3> region = { img_lvl[i].w, img_lvl[i].h, 1 };
+
+            queue.enqueueCopyBufferToImage(
+                scratch_buf.mem,
+                img_lvl[i].image_mem,
+                0,
+                origin,
+                region
+            );
+        }
+    
+        save_ocl_image(img_lvl[i], queue, "G"+std::to_string(i)+".png");
+    }
+
+    return 0;
+}
+
+
+float calc_flow( 
+    ocl_pyramid<3, SINGLE_CHANNEL_TYPE,    CL_UNSIGNED_INT8> &I,
+    ocl_pyramid<3, SINGLE_CHANNEL_TYPE,    CL_UNSIGNED_INT8> &J,
+    ocl_pyramid<3, SINGLE_CHANNEL_TYPE,    CL_SIGNED_INT16> &Ix,
+    ocl_pyramid<3, SINGLE_CHANNEL_TYPE,    CL_SIGNED_INT16> &Iy,
+    ocl_pyramid<3, CL_RGBA, CL_SIGNED_INT32> &G,
+    ocl_pyramid<3, CL_RGBA, CL_FLOAT> &J_float,
+    ocl_buffer flowLvl[3],
+    cl::Kernel lkflow_kernel )
+{
+    int lvls = 3;
+    float t_flow = 0.0f;
+
+    for (int i = lvls - 1; i >= 0; i--)
+    {
+        int use_guess = (i < lvls - 1) ? 1 : 0;
+
+        cl::NDRange local( 16, 8 );
+        cl::NDRange global( 16 * DivUp( flow_lvl[i].w, 16 ), 8 * DivUp( flow_lvl[i].h, 8) );
+
+        int arg_cnt = 0;
+        lkflow_kernel.setArg(arg_cnt++, I.img_lvl[i].image_mem);
+        lkflow_kernel.setArg(arg_cnt++, Ix.img_lvl[i].image_mem);
+        lkflow_kernel.setArg(arg_cnt++, Iy.img_lvl[i].image_mem);
+        lkflow_kernel.setArg(arg_cnt++, G.img_lvl[i].image_mem);
+        lkflow_kernel.setArg(arg_cnt++, J_float.img_lvl[i].image_mem);
+
+        if (use_guess)
+        {
+            lkflow_kernel.setArg(arg_cnt++, flow_lvl[i+1].mem);
+            lkflow_kernel.setArg(arg_cnt++, flow_lvl[i+1].w);
+        } 
+        else 
+        {
+            lkflow_kernel.setArg(arg_cnt++, flow_lvl[0].mem);
+            lkflow_kernel.setArg(arg_cnt++, flow_lvl[0].w);
+        }
+
+        lkflow_kernel.setArg(arg_cnt++, flow_lvl[i].mem);
+        lkflow_kernel.setArg(arg_cnt++, flow_lvl[i].w);
+        lkflow_kernel.setArg(arg_cnt++, flow_lvl[i].h);
+        lkflow_kernel.setArg(arg_cnt++, use_guess);
+
+        queue.enqueueNDRangeKernel(lkflow_kernel, cl::NullRange, global, local);    
+
+        save_image_float2(flow_lvl[i], queue, "flow"+std::to_string(i)+".png");
+    }
+
+    return t_flow;
+}
+
 
 
 int main(int argc, char *argv[]) 
@@ -408,41 +621,73 @@ int main(int argc, char *argv[])
     }
 
     cl::Program filter_program = build_cl_program_from_file("filters.cl");    
+    cl::Program lkflow_program = build_cl_program_from_file("lkflow.cl");  
+    cl::Program motion_program = build_cl_program_from_file("motion.cl");  
 
     filter_1x3          = cl::Kernel(filter_program, "filter_1x3_g");
     filter_3x1          = cl::Kernel(filter_program, "filter_3x1_g");
     downfilter_kernel_x = cl::Kernel(filter_program, "downfilter_x_g");
     downfilter_kernel_y = cl::Kernel(filter_program, "downfilter_y_g");
+    convert_kernel      = cl::Kernel(filter_program, "convertToRGBAFloat");
     print_kernel        = cl::Kernel(filter_program, "same_img");
+    filter_G            = cl::Kernel(filter_program, "filter_G");
+    lkflow_kernel       = cl::Kernel(lkflow_program, "lkflow");
+    update_motion_kernel = cl::Kernel(motion_program, "motion");
 
     std::string image_path(argv[1]);
 
-    ocl_image<CL_R, CL_UNSIGNED_INT8> img1;
-    ocl_pyramid<3, CL_R, CL_UNSIGNED_INT8> *I;
-    ocl_pyramid<3, CL_R, CL_SIGNED_INT16> *Ix;
-    ocl_pyramid<3, CL_R, CL_SIGNED_INT16> *Iy;
-
+    ocl_image<SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8> img1;
+    ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8> *I;
+    ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8> *J;
+    ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16> *Ix;
+    ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16> *Iy;
+    ocl_pyramid<3, CL_RGBA, CL_SIGNED_INT32> *G;
+    ocl_pyramid<3, CL_RGBA, CL_FLOAT> *J_float;
 
     img1 = ocl_load_image(context, image_path);
+    ocl_image img2 = ocl_load_image(context, "frame11.png");
 
-    I   = new ocl_pyramid<3, CL_R, CL_UNSIGNED_INT8>();
-    Ix  = new ocl_pyramid<3, CL_R, CL_SIGNED_INT16>();
-    Iy  = new ocl_pyramid<3, CL_R, CL_SIGNED_INT16>();
+    I       = new ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8>();
+    J       = new ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_UNSIGNED_INT8>();
+    Ix      = new ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16>();
+    Iy      = new ocl_pyramid<3, SINGLE_CHANNEL_TYPE, CL_SIGNED_INT16>();
+    G       = new ocl_pyramid<3, CL_RGBA, CL_SIGNED_INT32>();
+    J_float = new ocl_pyramid<3, CL_RGBA, CL_FLOAT>();
 
     I->init(img1.w, img1.h);
+    J->init(img1.w, img1.h);
     Ix->init(img1.w, img1.h);
     Iy->init(img1.w, img1.h);
+    G->init(img1.w, img1.h);
+    J_float->init(img1.w, img1.h);
+
+    for (int i=0; i < 3; i++) 
+    {
+        flow_lvl[i].w = img1.w >> i;
+        flow_lvl[i].h = img1.h >> i;
+        flow_lvl[i].image_format = cl::ImageFormat(CL_RG, CL_FLOAT);
+        int size = flow_lvl[i].w * flow_lvl[i].h* sizeof(cl_float2) ;
+        flow_lvl[i].mem = cl::Buffer(context, CL_MEM_READ_WRITE, size);
+    }
+
+    // do the flow
 
     I->fill(img1, downfilter_kernel_x, downfilter_kernel_y);
-
+    J->fill(img2, downfilter_kernel_x, downfilter_kernel_y);
 
     cl_int4 dx_Wx = { -1,  0,  1, 0 };
     cl_int4 dx_Wy = {  3, 10,  3, 0 };
     Ix->pyr_fill(*I, filter_3x1, filter_1x3, dx_Wx, dx_Wy);
 
-    // cl_int4 dy_Wx = {  3, 10, 3, 0 };
-    // cl_int4 dy_Wy = { -1,  0, 1, 0 }; 
-    // Iy.pyr_fill(I, filter_3x1, filter_1x3, dx_Wx, dx_Wy);
+    cl_int4 dy_Wx = {  3, 10, 3, 0 };
+    cl_int4 dy_Wy = { -1,  0, 1, 0 }; 
+    Iy->pyr_fill(*I, filter_3x1, filter_1x3, dy_Wx, dy_Wy);
+
+    G->G_Fill(*Ix, *Iy, filter_G);
+    J_float->convFill(*J, convert_kernel);
+
+    float t_flow = 0.0f;
+    t_flow = calc_flow( *I, *J, *Ix, *Iy, *G, *J_float, flow_lvl, lkflow_kernel );
 
 
 
